@@ -19,20 +19,26 @@ defmodule Casbin.Internal.Digraph do
   `v` to `w`.
   """
 
-  defstruct vertices: %{}, adj: %{}
+  defstruct vertices: %{}, adj: %{}, version: nil
 
   @type vertex_id() :: non_neg_integer()
   @type vertex() :: term()
   @type t() :: %__MODULE__{
           vertices: %{vertex_id() => vertex()},
-          adj: %{vertex_id() => MapSet.t()}
+          adj: %{vertex_id() => MapSet.t()},
+          version: reference() | nil
         }
 
   @doc """
   Creates a new empty digraph.
+
+  The `version` reference identifies the current edge set: every edge
+  mutation replaces it, so it can safely key memoized reachability results
+  (references are globally unique — no collisions between graphs or
+  versions).
   """
   @spec new() :: t()
-  def new, do: %__MODULE__{}
+  def new, do: %__MODULE__{version: make_ref()}
 
   @doc """
   Returns a list of all the vertices in the digraph. Since the underlying
@@ -107,7 +113,7 @@ defmodule Casbin.Internal.Digraph do
     %{adj: adj} = g = g |> add_vertex(v) |> add_vertex(w)
     v_id = hash(v)
     v_adj = Map.get(adj, v_id) |> MapSet.put(hash(w))
-    %{g | adj: %{adj | v_id => v_adj}}
+    %{g | adj: %{adj | v_id => v_adj}, version: make_ref()}
   end
 
   @doc """
@@ -132,7 +138,7 @@ defmodule Casbin.Internal.Digraph do
          w_id <- hash(w),
          v_adj when not is_nil(v_adj) <- Map.get(adj, v_id) do
       v_adj = v_adj |> MapSet.delete(w_id)
-      %{g | adj: %{adj | v_id => v_adj}}
+      %{g | adj: %{adj | v_id => v_adj}, version: make_ref()}
     else
       nil -> g
     end
@@ -196,25 +202,64 @@ defmodule Casbin.Internal.Digraph do
     end
   end
 
+  @doc """
+  Returns the set of vertex ids reachable from `v` (including `v` itself
+  when it is present in the graph). Membership of a vertex `w` can be
+  tested with `reachable_id?/2`.
+  """
+  @spec reachable(t(), vertex()) :: MapSet.t(vertex_id())
+  def reachable(%__MODULE__{} = g, v) do
+    g |> dfs(hash(v)) |> Map.keys() |> MapSet.new()
+  end
+
+  @doc """
+  Returns `true` if the vertex `w` is a member of a reachable-id set
+  produced by `reachable/2`.
+  """
+  @spec reachable_id?(MapSet.t(vertex_id()), vertex()) :: boolean()
+  def reachable_id?(%MapSet{} = ids, w), do: MapSet.member?(ids, hash(w))
+
+  @doc """
+  Returns the vertices reachable from `v` (including `v` itself when
+  present in the graph).
+  """
+  @spec reachable_vertices(t(), vertex()) :: [vertex()]
+  def reachable_vertices(%__MODULE__{vertices: vertices} = g, v) do
+    g
+    |> dfs(hash(v))
+    |> Map.keys()
+    |> Enum.flat_map(fn id ->
+      case Map.fetch(vertices, id) do
+        {:ok, vertex} -> [vertex]
+        :error -> []
+      end
+    end)
+  end
+
   # Depth-first search algorithm.
 
-  defp dfs(%__MODULE__{adj: adj} = g, v) do
+  defp dfs(%__MODULE__{adj: adj}, v) do
     case Map.get(adj, v) do
       nil ->
         %{}
 
       _ ->
-        dfs(g, v, %{})
+        dfs(adj, [v], %{})
     end
   end
 
-  defp dfs(%__MODULE__{adj: adj} = g, v, visited) do
-    visited = Map.put(visited, v, true)
+  # Iterative worklist so long inheritance chains cannot grow the stack
+  # and revisited vertices (diamond/triangle graphs) are skipped.
+  defp dfs(_adj, [], visited), do: visited
 
-    Map.get(adj, v)
-    |> Enum.reduce(visited, fn w, acc ->
-      !Map.get(acc, w) && dfs(g, w, acc)
-    end)
+  defp dfs(adj, [v | rest], visited) do
+    if Map.get(visited, v) do
+      dfs(adj, rest, visited)
+    else
+      visited = Map.put(visited, v, true)
+      neighbors = adj |> Map.get(v, MapSet.new()) |> MapSet.to_list()
+      dfs(adj, neighbors ++ rest, visited)
+    end
   end
 
   # 2^32
