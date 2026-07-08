@@ -1,0 +1,19 @@
+# Infrastructure for the opt-in integration tests:
+#
+#   docker compose -f test/docker/docker-compose.yml up -d
+#   mix test --include redis --include postgres
+#
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: casbin
+      POSTGRES_PASSWORD: casbin
+      POSTGRES_DB: casbin_test
+    ports:
+      - "5432:5432"

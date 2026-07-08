@@ -14,12 +14,20 @@ defmodule Casbin.EnforcerSupervisor do
   end
 
   @doc """
-  Starts a new `Enforcer` process and supervises it
+  Starts a new `Enforcer` process and supervises it.
+
+  The optional third argument wires the enforcer before it serves its
+  first request — see `Casbin.EnforcerServer.start_link/3`:
+
+      Casbin.EnforcerSupervisor.start_enforcer("acl", cfile,
+        adapter: EctoAdapter.new(MyApp.Repo),
+        watcher: {Casbin.Watcher.RedisWatcher, :acl_watcher}
+      )
   """
-  def start_enforcer(ename, cfile) do
+  def start_enforcer(ename, cfile, opts \\ []) do
     child_spec = %{
       id: Casbin.EnforcerServer,
-      start: {Casbin.EnforcerServer, :start_link, [ename, cfile]},
+      start: {Casbin.EnforcerServer, :start_link, [ename, cfile, opts]},
       restart: :permanent
     }
 

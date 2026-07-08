@@ -5,15 +5,25 @@ defmodule Casbin.Enforcer do
 
   defstruct model: nil,
             policies: [],
+            policy_set: MapSet.new(),
             mapping_policies: [],
+            mapping_policy_set: MapSet.new(),
             role_groups: [],
             env: %{},
-            persist_adapter: nil
+            persist_adapter: nil,
+            watcher: nil,
+            watcher_instance_id: nil,
+            revision: 0
 
+  alias Casbin.Internal.PatternCache
   alias Casbin.Internal.RoleGroup
   alias Casbin.Model
+  alias Casbin.Model.PolicyEffect
   alias Casbin.Persist.PersistAdapter
+  alias Casbin.Persist.PersistAdapterBatch
   alias Casbin.Persist.ReadonlyFileAdapter
+
+  require Logger
 
   @type mapping() ::
           {atom(), String.t(), String.t()}
@@ -22,10 +32,15 @@ defmodule Casbin.Enforcer do
   @type t() :: %__MODULE__{
           model: Model.t(),
           policies: [Model.Policy.t()],
-          mapping_policies: [String.t()],
+          policy_set: MapSet.t(Model.Policy.t()),
+          mapping_policies: [mapping()],
+          mapping_policy_set: MapSet.t(mapping()),
           role_groups: %{atom() => RoleGroup.t()},
           env: map(),
-          persist_adapter: PersistAdapter.t()
+          persist_adapter: PersistAdapter.t(),
+          watcher: Casbin.Watcher.t() | nil,
+          watcher_instance_id: String.t() | nil,
+          revision: non_neg_integer()
         }
 
   @doc """
@@ -81,9 +96,35 @@ defmodule Casbin.Enforcer do
   Returns `true` if `request` is allowed, otherwise `false`.
   """
   @spec allow?(t(), [String.t()]) :: boolean()
-  def allow?(%__MODULE__{model: model} = e, request) when is_list(request) do
-    matched_policies = list_matched_policies(e, request)
-    Model.allow?(model, matched_policies)
+  def allow?(
+        %__MODULE__{model: %Model{effect: effect} = model, policies: policies, env: env},
+        request
+      )
+      when is_list(request) do
+    case Model.create_request(model, request) do
+      {:error, _reason} ->
+        Model.allow?(model, [])
+
+      {:ok, req} ->
+        # Short-circuit on the first decisive policy instead of matching
+        # the full policy list; both supported effects allow this.
+        case PolicyEffect.mode(effect) do
+          :allow_override -> decisive_match?(model, policies, req, env, true)
+          :deny_override -> not decisive_match?(model, policies, req, env, false)
+        end
+    end
+  end
+
+  # Scans until the first matched policy whose eft equals the decisive
+  # kind (`allow?` == decisive_allow?) and returns whether one was found.
+  defp decisive_match?(model, policies, req, env, decisive_allow?) do
+    Enum.reduce_while(policies, false, fn pol, acc ->
+      if Model.match?(model, req, pol, env) and Model.Policy.allow?(pol) == decisive_allow? do
+        {:halt, true}
+      else
+        {:cont, acc}
+      end
+    end)
   end
 
   #
@@ -124,12 +165,23 @@ defmodule Casbin.Enforcer do
 
   @spec load_policy(t(), {atom(), [String.t()]}) :: t() | {:error, String.t()}
   defp load_policy(
-         %__MODULE__{model: model, policies: policies, persist_adapter: adapter} = enforcer,
+         %__MODULE__{
+           model: model,
+           policies: policies,
+           policy_set: policy_set,
+           persist_adapter: adapter
+         } = enforcer,
          {key, attrs}
        ) do
     with {:ok, policy} <- Model.create_policy(model, {key, attrs}),
-         false <- Enum.member?(policies, policy) do
-      enforcer = %{enforcer | policies: [policy | policies], persist_adapter: adapter}
+         false <- MapSet.member?(policy_set, policy) do
+      enforcer = %{
+        enforcer
+        | policies: [policy | policies],
+          policy_set: MapSet.put(policy_set, policy),
+          persist_adapter: adapter
+      }
+
       {:ok, enforcer}
     else
       {:error, reason} -> {:error, reason}
@@ -148,21 +200,101 @@ defmodule Casbin.Enforcer do
   end
 
   @doc """
+  Adds a batch of policy rules in one shot: one in-memory update and one
+  batched adapter write (see `Casbin.Persist.PersistAdapterBatch`).
+
+  Rules already present are skipped; invalid rules fail the whole call
+  without changing anything.
+  """
+  @spec add_policies(t(), [{atom(), [String.t()]}]) :: t() | {:error, any()}
+  def add_policies(%__MODULE__{} = enforcer, rules) when is_list(rules) do
+    case validate_rules(enforcer, rules) do
+      {:error, reason} ->
+        {:error, reason}
+
+      {:ok, policies} ->
+        fresh =
+          policies
+          |> Enum.uniq()
+          |> Enum.reject(fn {_rule, policy} -> MapSet.member?(enforcer.policy_set, policy) end)
+          |> Enum.map(fn {rule, _policy} -> rule end)
+
+        case PersistAdapterBatch.add_policies(enforcer.persist_adapter, fresh) do
+          {:ok, adapter} ->
+            fresh
+            |> Enum.reduce(enforcer, &apply_added_policy(&2, &1))
+            |> Map.put(:persist_adapter, adapter)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @doc """
+  Removes a batch of policy rules in one shot; rules that are not present
+  are ignored.
+  """
+  @spec remove_policies(t(), [{atom(), [String.t()]}]) :: t() | {:error, any()}
+  def remove_policies(%__MODULE__{} = enforcer, rules) when is_list(rules) do
+    present =
+      rules
+      |> Enum.uniq()
+      |> Enum.filter(fn rule ->
+        case Model.create_policy(enforcer.model, rule) do
+          {:ok, policy} -> MapSet.member?(enforcer.policy_set, policy)
+          {:error, _} -> false
+        end
+      end)
+
+    case PersistAdapterBatch.remove_policies(enforcer.persist_adapter, present) do
+      {:ok, adapter} ->
+        present
+        |> Enum.reduce(enforcer, &apply_removed_policy(&2, &1))
+        |> Map.put(:persist_adapter, adapter)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_rules(%__MODULE__{model: model}, rules) do
+    Enum.reduce_while(rules, {:ok, []}, fn rule, {:ok, acc} ->
+      case Model.create_policy(model, rule) do
+        {:ok, policy} -> {:cont, {:ok, [{rule, policy} | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, pairs} -> {:ok, Enum.reverse(pairs)}
+      error -> error
+    end
+  end
+
+  @doc """
   Removes the policy rule or rules that match from the enforcer.
   """
   def remove_policy(
-        %__MODULE__{model: model, policies: policies, persist_adapter: adapter} = enforcer,
+        %__MODULE__{model: model, policy_set: policy_set, persist_adapter: adapter} = enforcer,
         {key, attrs}
       ) do
     with {:ok, policy} <- Model.create_policy(model, {key, attrs}),
-         true <- Enum.member?(policies, policy),
-         {:ok, _adapter} <- PersistAdapter.remove_policy(adapter, {key, attrs}),
-         policies <- Enum.reject(policies, fn p -> p == policy end) do
-      %{enforcer | policies: policies}
+         true <- MapSet.member?(policy_set, policy),
+         {:ok, _adapter} <- PersistAdapter.remove_policy(adapter, {key, attrs}) do
+      drop_policy(enforcer, policy)
     else
       false -> {:error, :nonexistent}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Memory-only removal of an existing policy struct.
+  defp drop_policy(%__MODULE__{policies: policies, policy_set: policy_set} = enforcer, policy) do
+    %{
+      enforcer
+      | policies: Enum.reject(policies, fn p -> p == policy end),
+        policy_set: MapSet.delete(policy_set, policy)
+    }
   end
 
   @spec remove_policy!(any, any) :: t()
@@ -213,15 +345,28 @@ defmodule Casbin.Enforcer do
   """
   @spec remove_filtered_policy(t(), atom(), integer(), keyword()) :: t() | {:error, any()}
   def remove_filtered_policy(
-        %__MODULE__{policies: policies, persist_adapter: adapter} = enforcer,
+        %__MODULE__{persist_adapter: adapter} = enforcer,
         req_key,
         idx,
         req
       )
       when is_atom(req_key) and is_integer(idx) and is_list(req) do
-    filtered_policies =
+    case PersistAdapter.remove_filtered_policy(adapter, req_key, idx, req) do
+      {:ok, adapter} ->
+        enforcer
+        |> drop_filtered_policies(req_key, idx, req)
+        |> Map.put(:persist_adapter, adapter)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Memory-only removal of the policies matching the positional filter.
+  defp drop_filtered_policies(%__MODULE__{policies: policies} = enforcer, req_key, idx, req) do
+    {removed, kept} =
       policies
-      |> Enum.reject(fn %{key: key, attrs: attrs} ->
+      |> Enum.split_with(fn %{key: key, attrs: attrs} ->
         attr_values =
           attrs
           |> Enum.map(&elem(&1, 1))
@@ -230,13 +375,11 @@ defmodule Casbin.Enforcer do
         [key | attr_values] === [req_key | req]
       end)
 
-    case PersistAdapter.remove_filtered_policy(adapter, req_key, idx, req) do
-      {:ok, adapter} ->
-        %{enforcer | policies: filtered_policies, persist_adapter: adapter}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    %{
+      enforcer
+      | policies: kept,
+        policy_set: MapSet.difference(enforcer.policy_set, MapSet.new(removed))
+    }
   end
 
   @spec remove_filtered_policy!(t(), atom(), integer(), keyword()) :: t()
@@ -475,12 +618,13 @@ defmodule Casbin.Enforcer do
        )
        when is_atom(mapping_name) and is_binary(role1) and is_binary(role2) do
     with group when not is_nil(group) <- Map.get(groups, mapping_name),
-         false <- Enum.member?(mappings, mapping),
+         false <- MapSet.member?(enforcer.mapping_policy_set, mapping),
          group <- RoleGroup.add_inheritance(group, {role1, role2}) do
       new_enforcer = %{
         enforcer
         | role_groups: %{groups | mapping_name => group},
           mapping_policies: [mapping | mappings],
+          mapping_policy_set: MapSet.put(enforcer.mapping_policy_set, mapping),
           persist_adapter: adapter,
           env: %{env | mapping_name => RoleGroup.stub_2(group)}
       }
@@ -508,12 +652,13 @@ defmodule Casbin.Enforcer do
        )
        when is_atom(mapping_name) and is_binary(role1) and is_binary(role2) and is_binary(dom) do
     with group when not is_nil(group) <- Map.get(groups, mapping_name),
-         false <- Enum.member?(mappings, mapping),
+         false <- MapSet.member?(enforcer.mapping_policy_set, mapping),
          group <- RoleGroup.add_inheritance(group, {{role1, dom}, {role2, dom}}) do
       new_enforcer = %{
         enforcer
         | role_groups: %{groups | mapping_name => group},
           mapping_policies: [mapping | mappings],
+          mapping_policy_set: MapSet.put(enforcer.mapping_policy_set, mapping),
           persist_adapter: adapter,
           env: %{env | mapping_name => RoleGroup.stub_3(group)}
       }
@@ -715,60 +860,78 @@ defmodule Casbin.Enforcer do
   """
   @spec remove_mapping_policy(t(), {atom(), String.t(), String.t()}) :: t() | {:error, String.t()}
   def remove_mapping_policy(
-        %__MODULE__{
-          mapping_policies: mappings,
-          role_groups: groups,
-          env: env,
-          persist_adapter: adapter
-        } = enforcer,
+        %__MODULE__{role_groups: groups, persist_adapter: adapter} = enforcer,
         {mapping_name, role1, role2} = mapping
       )
       when is_atom(mapping_name) and is_binary(role1) and is_binary(role2) do
     with group when not is_nil(group) <- Map.get(groups, mapping_name),
-         group <- RoleGroup.remove_inheritance(group, {role1, role2}),
-         mappings <- Enum.reject(mappings, fn m -> m == mapping end),
          {:ok, adapter} <- PersistAdapter.remove_policy(adapter, {mapping_name, [role1, role2]}) do
-      %{
-        enforcer
-        | role_groups: %{groups | mapping_name => group},
-          mapping_policies: mappings,
-          persist_adapter: adapter,
-          env: %{env | mapping_name => RoleGroup.stub_2(group)}
-      }
+      %{drop_mapping_policy(enforcer, mapping) | persist_adapter: adapter}
     else
       nil ->
         {:error, "mapping name not found: `#{mapping_name}`"}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   @spec remove_mapping_policy(t(), {atom(), String.t(), String.t(), String.t()}) ::
           t() | {:error, String.t()}
   def remove_mapping_policy(
-        %__MODULE__{
-          mapping_policies: mappings,
-          role_groups: groups,
-          env: env,
-          persist_adapter: adapter
-        } = enforcer,
+        %__MODULE__{role_groups: groups, persist_adapter: adapter} = enforcer,
         {mapping_name, role1, role2, dom} = mapping
       )
       when is_atom(mapping_name) and is_binary(role1) and is_binary(role2) and is_binary(dom) do
     with group when not is_nil(group) <- Map.get(groups, mapping_name),
-         group <- RoleGroup.remove_inheritance(group, {{role1, dom}, {role2, dom}}),
-         mappings <- Enum.reject(mappings, fn m -> m == mapping end),
-         {:ok, _adpater} <-
+         {:ok, adapter} <-
            PersistAdapter.remove_policy(adapter, {mapping_name, [role1, role2, dom]}) do
-      %{
-        enforcer
-        | role_groups: %{groups | mapping_name => group},
-          mapping_policies: mappings,
-          persist_adapter: adapter,
-          env: %{env | mapping_name => RoleGroup.stub_3(group)}
-      }
+      %{drop_mapping_policy(enforcer, mapping) | persist_adapter: adapter}
     else
       nil ->
         {:error, "mapping name not found: `#{mapping_name}`"}
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  # Memory-only removal of a mapping policy: updates the role graph, the
+  # mapping lists and the matcher env stub. The mapping name must exist.
+  defp drop_mapping_policy(
+         %__MODULE__{role_groups: groups, env: env} = enforcer,
+         {mapping_name, role1, role2} = mapping
+       ) do
+    group =
+      groups
+      |> Map.fetch!(mapping_name)
+      |> RoleGroup.remove_inheritance({role1, role2})
+
+    %{
+      enforcer
+      | role_groups: %{groups | mapping_name => group},
+        mapping_policies: Enum.reject(enforcer.mapping_policies, fn m -> m == mapping end),
+        mapping_policy_set: MapSet.delete(enforcer.mapping_policy_set, mapping),
+        env: %{env | mapping_name => RoleGroup.stub_2(group)}
+    }
+  end
+
+  defp drop_mapping_policy(
+         %__MODULE__{role_groups: groups, env: env} = enforcer,
+         {mapping_name, role1, role2, dom} = mapping
+       ) do
+    group =
+      groups
+      |> Map.fetch!(mapping_name)
+      |> RoleGroup.remove_inheritance({{role1, dom}, {role2, dom}})
+
+    %{
+      enforcer
+      | role_groups: %{groups | mapping_name => group},
+        mapping_policies: Enum.reject(enforcer.mapping_policies, fn m -> m == mapping end),
+        mapping_policy_set: MapSet.delete(enforcer.mapping_policy_set, mapping),
+        env: %{env | mapping_name => RoleGroup.stub_3(group)}
+    }
   end
 
   def remove_mapping_policy!(
@@ -892,6 +1055,7 @@ defmodule Casbin.Enforcer do
 
     case PersistAdapter.save_policies(adapter, policies) do
       {:error, errors} -> {:error, errors}
+      {:ok, adapter} -> %{enforcer | persist_adapter: adapter}
       adapter -> %{enforcer | persist_adapter: adapter}
     end
   end
@@ -903,6 +1067,155 @@ defmodule Casbin.Enforcer do
 
       enforcer ->
         enforcer
+    end
+  end
+
+  #
+  # Replication support.
+  #
+  # The `apply_*` functions mutate only the in-memory state. They exist for
+  # multi-instance deployments where another instance already persisted a
+  # change and broadcast it (see `Casbin.Watcher`); the receiving instance
+  # must apply the change without writing it to storage again. They are
+  # idempotent: applying an already-present add or an already-gone remove
+  # leaves the enforcer unchanged instead of returning an error.
+  #
+
+  @doc """
+  Adds a policy rule to the in-memory state only, without persisting it.
+
+  No-op if the rule is already present.
+  """
+  @spec apply_added_policy(t(), {atom(), [String.t()]}) :: t()
+  def apply_added_policy(%__MODULE__{} = enforcer, {_key, _attrs} = rule) do
+    case load_policy(enforcer, rule) do
+      {:ok, enforcer} ->
+        enforcer
+
+      {:error, :already_existed} ->
+        enforcer
+
+      {:error, reason} ->
+        Logger.debug("casbin: ignoring replicated policy #{inspect(rule)}: #{inspect(reason)}")
+        enforcer
+    end
+  end
+
+  @doc """
+  Removes a policy rule from the in-memory state only, without touching
+  the persist adapter.
+
+  No-op if the rule is not present.
+  """
+  @spec apply_removed_policy(t(), {atom(), [String.t()]}) :: t()
+  def apply_removed_policy(
+        %__MODULE__{model: model, policy_set: policy_set} = enforcer,
+        {_key, _attrs} = rule
+      ) do
+    with {:ok, policy} <- Model.create_policy(model, rule),
+         true <- MapSet.member?(policy_set, policy) do
+      drop_policy(enforcer, policy)
+    else
+      _ -> enforcer
+    end
+  end
+
+  @doc """
+  Removes the policies matching the positional filter from the in-memory
+  state only, without touching the persist adapter.
+  """
+  @spec apply_removed_filtered_policy(t(), atom(), integer(), [String.t()]) :: t()
+  def apply_removed_filtered_policy(%__MODULE__{} = enforcer, req_key, idx, req)
+      when is_atom(req_key) and is_integer(idx) and is_list(req) do
+    drop_filtered_policies(enforcer, req_key, idx, req)
+  end
+
+  @doc """
+  Adds a mapping (role inheritance) policy to the in-memory state only,
+  without persisting it.
+
+  No-op if the mapping is already present or its mapping name is unknown.
+  """
+  @spec apply_added_mapping_policy(t(), mapping()) :: t()
+  def apply_added_mapping_policy(%__MODULE__{} = enforcer, mapping) when is_tuple(mapping) do
+    case load_mapping_policy(enforcer, mapping) do
+      {:ok, enforcer} ->
+        enforcer
+
+      {:error, :already_existed} ->
+        enforcer
+
+      {:error, reason} ->
+        Logger.debug(
+          "casbin: ignoring replicated mapping #{inspect(mapping)}: #{inspect(reason)}"
+        )
+
+        enforcer
+    end
+  end
+
+  @doc """
+  Removes a mapping (role inheritance) policy from the in-memory state
+  only, without touching the persist adapter.
+
+  No-op if the mapping is not present.
+  """
+  @spec apply_removed_mapping_policy(t(), mapping()) :: t()
+  def apply_removed_mapping_policy(%__MODULE__{role_groups: groups} = enforcer, mapping)
+      when is_tuple(mapping) do
+    if Map.has_key?(groups, elem(mapping, 0)) and
+         MapSet.member?(enforcer.mapping_policy_set, mapping) do
+      drop_mapping_policy(enforcer, mapping)
+    else
+      enforcer
+    end
+  end
+
+  @doc """
+  Discards all in-memory policies and mapping policies and reloads both
+  from the persist adapter.
+
+  Unlike re-initializing the enforcer, this preserves the configured
+  persist adapter and any user-defined functions added with `add_fun/2`.
+  Use this to re-synchronize with storage after missed updates.
+  """
+  @spec reload_policies!(t()) :: t() | {:error, any()}
+  def reload_policies!(%__MODULE__{model: model, env: env} = enforcer) do
+    %Model{role_mappings: role_mappings} = model
+    role_groups = role_mappings |> Enum.map(fn m -> {m, RoleGroup.new(m)} end) |> Map.new()
+    builtins = init_env()
+
+    # Reset the role stubs in env to the fresh (empty) groups while leaving
+    # built-ins and user-added functions untouched; init/1 gives built-ins
+    # priority over role stub names, so do the same here.
+    role_stubs =
+      for {name, group} <- role_groups, not Map.has_key?(builtins, name), into: %{} do
+        {name, RoleGroup.stub_2(group)}
+      end
+
+    reset = %{
+      enforcer
+      | policies: [],
+        policy_set: MapSet.new(),
+        mapping_policies: [],
+        mapping_policy_set: MapSet.new(),
+        role_groups: role_groups,
+        env: Map.merge(env, role_stubs)
+    }
+
+    # Fold through apply_added_policy/2 instead of load_policies!/1 so
+    # duplicate rows in storage (possible without a unique index) are
+    # skipped rather than raising mid-reload.
+    case PersistAdapter.load_policies(reset.persist_adapter) do
+      {:ok, raw_policies} ->
+        raw_policies
+        |> Enum.map(fn [key | attrs] -> [String.to_atom(key) | attrs] end)
+        |> Enum.filter(fn [key | _] -> Model.has_policy_key?(model, key) end)
+        |> Enum.reduce(reset, fn [key | attrs], e -> apply_added_policy(e, {key, attrs}) end)
+        |> load_mapping_policies!()
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -951,12 +1264,17 @@ defmodule Casbin.Enforcer do
   """
   @spec regex_match?(String.t(), String.t()) :: boolean()
   def regex_match?(str, pattern) do
-    case Regex.compile("^#{pattern}$") do
-      {:error, _} ->
-        false
+    compiled =
+      PatternCache.fetch(:regex_match, pattern, fn ->
+        case Regex.compile("^#{pattern}$") do
+          {:ok, r} -> {:ok, r}
+          {:error, _} -> :error
+        end
+      end)
 
-      {:ok, r} ->
-        Regex.match?(r, str)
+    case compiled do
+      {:ok, r} -> Regex.match?(r, str)
+      :error -> false
     end
   end
 
@@ -1049,14 +1367,22 @@ defmodule Casbin.Enforcer do
   """
   @spec key_match2?(String.t(), String.t()) :: boolean()
   def key_match2?(key1, key2) do
-    key2 = String.replace(key2, "/*", "/.*")
+    compiled =
+      PatternCache.fetch(:key_match2, key2, fn ->
+        match =
+          key2
+          |> String.replace("/*", "/.*")
+          |> then(&Regex.replace(path_var_regex(), &1, "[^/]+"))
 
-    with {:ok, r1} <- Regex.compile(":[^/]+"),
-         match <- Regex.replace(r1, key2, "[^/]+"),
-         {:ok, r2} <- Regex.compile("^" <> match <> "$") do
-      Regex.match?(r2, key1)
-    else
-      _ -> false
+        case Regex.compile("^" <> match <> "$") do
+          {:ok, r} -> {:ok, r}
+          {:error, _} -> :error
+        end
+      end)
+
+    case compiled do
+      {:ok, r} -> Regex.match?(r, key1)
+      :error -> false
     end
   end
 
@@ -1077,24 +1403,25 @@ defmodule Casbin.Enforcer do
   """
   @spec key_get2(String.t(), String.t(), String.t()) :: String.t()
   def key_get2(key1, key2, path_var) do
-    key2 = String.replace(key2, "/*", "/.*")
+    compiled =
+      PatternCache.fetch(:key_get2, key2, fn ->
+        key2 = String.replace(key2, "/*", "/.*")
+        keys = path_var_regex() |> Regex.scan(key2) |> Enum.map(fn [k] -> k end)
+        replaced = Regex.replace(path_var_regex(), key2, "([^/]+)")
 
-    with {:ok, r1} <- Regex.compile(":[^/]+"),
-         keys <- Regex.scan(r1, key2) |> Enum.map(fn [k] -> k end),
-         key2 <- Regex.replace(r1, key2, "([^/]+)"),
-         {:ok, r2} <- Regex.compile("^" <> key2 <> "$"),
-         matches <- Regex.run(r2, key1) do
-      if matches && length(matches) > 1 do
-        values = Enum.drop(matches, 1)
+        case Regex.compile("^" <> replaced <> "$") do
+          {:ok, r} -> {:ok, r, keys}
+          {:error, _} -> :error
+        end
+      end)
 
-        keys
-        |> Enum.zip(values)
-        |> Enum.find_value("", fn {k, v} ->
-          if String.slice(k, 1..-1//1) == path_var, do: v
-        end)
-      else
-        ""
-      end
+    with {:ok, r2, keys} <- compiled,
+         [_ | [_ | _] = values] <- Regex.run(r2, key1) do
+      keys
+      |> Enum.zip(values)
+      |> Enum.find_value("", fn {k, v} ->
+        if String.slice(k, 1..-1//1) == path_var, do: v
+      end)
     else
       _ -> ""
     end
@@ -1116,14 +1443,22 @@ defmodule Casbin.Enforcer do
   """
   @spec key_match3?(String.t(), String.t()) :: boolean()
   def key_match3?(key1, key2) do
-    key2 = String.replace(key2, "/*", "/.*")
+    compiled =
+      PatternCache.fetch(:key_match3, key2, fn ->
+        match =
+          key2
+          |> String.replace("/*", "/.*")
+          |> then(&Regex.replace(brace_var_regex(), &1, "[^/]+"))
 
-    with {:ok, r1} <- Regex.compile("\\{[^/]+\\}"),
-         match <- Regex.replace(r1, key2, "[^/]+"),
-         {:ok, r2} <- Regex.compile("^" <> match <> "$") do
-      Regex.match?(r2, key1)
-    else
-      _ -> false
+        case Regex.compile("^" <> match <> "$") do
+          {:ok, r} -> {:ok, r}
+          {:error, _} -> :error
+        end
+      end)
+
+    case compiled do
+      {:ok, r} -> Regex.match?(r, key1)
+      :error -> false
     end
   end
 
@@ -1143,37 +1478,37 @@ defmodule Casbin.Enforcer do
   """
   @spec key_match4?(String.t(), String.t()) :: boolean()
   def key_match4?(key1, key2) do
-    key2 = String.replace(key2, "/*", "/.*")
+    compiled =
+      PatternCache.fetch(:key_match4, key2, fn ->
+        key2 = String.replace(key2, "/*", "/.*")
 
-    with {:ok, r1} <- Regex.compile("\\{([^/]+)\\}"),
-         tokens <- Regex.scan(r1, key2) |> Enum.map(fn [_, token] -> token end),
-         key2_pattern <- Regex.replace(r1, key2, "([^/]+)"),
-         {:ok, r2} <- Regex.compile("^" <> key2_pattern <> "$"),
-         matches <- Regex.run(r2, key1) do
-      if matches do
-        values = Enum.drop(matches, 1)
+        tokens =
+          brace_var_capture_regex()
+          |> Regex.scan(key2)
+          |> Enum.map(fn [_, token] -> token end)
 
-        if length(tokens) != length(values) do
-          false
-        else
-          # Build a map of token -> value and check for conflicts
-          tokens
-          |> Enum.zip(values)
-          |> Enum.reduce_while(%{}, fn {token, value}, acc ->
-            case Map.get(acc, token) do
-              nil -> {:cont, Map.put(acc, token, value)}
-              ^value -> {:cont, acc}
-              _ -> {:halt, :mismatch}
-            end
-          end)
-          |> case do
-            :mismatch -> false
-            _ -> true
-          end
+        key2_pattern = Regex.replace(brace_var_capture_regex(), key2, "([^/]+)")
+
+        case Regex.compile("^" <> key2_pattern <> "$") do
+          {:ok, r} -> {:ok, r, tokens}
+          {:error, _} -> :error
         end
-      else
-        false
-      end
+      end)
+
+    with {:ok, r2, tokens} <- compiled,
+         [_ | values] <- Regex.run(r2, key1),
+         true <- length(tokens) == length(values) do
+      # Build a map of token -> value and check for conflicts
+      tokens
+      |> Enum.zip(values)
+      |> Enum.reduce_while(%{}, fn {token, value}, acc ->
+        case Map.get(acc, token) do
+          nil -> {:cont, Map.put(acc, token, value)}
+          ^value -> {:cont, acc}
+          _ -> {:halt, :mismatch}
+        end
+      end)
+      |> Kernel.!=(:mismatch)
     else
       _ -> false
     end
@@ -1278,27 +1613,45 @@ defmodule Casbin.Enforcer do
   """
   @spec glob_match?(String.t(), String.t()) :: boolean()
   def glob_match?(key1, key2) do
-    # Convert glob pattern to regex pattern
-    # Process in order: escape dots, handle **, then handle *
-    pattern =
-      key2
-      |> String.replace(".", "\\.")
-      # Use null byte as temporary placeholder
-      |> String.replace("**", "\x00")
-      |> String.replace("*", "[^/]*")
-      # Replace placeholder with .*
-      |> String.replace("\x00", ".*")
-      |> then(&("^" <> &1 <> "$"))
+    compiled =
+      PatternCache.fetch(:glob_match, key2, fn ->
+        # Convert glob pattern to regex pattern
+        # Process in order: escape dots, handle **, then handle *
+        pattern =
+          key2
+          |> String.replace(".", "\\.")
+          # Use null byte as temporary placeholder
+          |> String.replace("**", "\x00")
+          |> String.replace("*", "[^/]*")
+          # Replace placeholder with .*
+          |> String.replace("\x00", ".*")
+          |> then(&("^" <> &1 <> "$"))
 
-    case Regex.compile(pattern) do
+        case Regex.compile(pattern) do
+          {:ok, regex} -> {:ok, regex}
+          {:error, _} -> :error
+        end
+      end)
+
+    case compiled do
       {:ok, regex} -> Regex.match?(regex, key1)
-      {:error, _} -> false
+      :error -> false
     end
   end
 
   #
   # Helpers
   #
+
+  # Constant helper regexes used to translate key patterns, compiled once
+  # at module load instead of on every call.
+  @path_var_regex ~r/:[^\/]+/
+  @brace_var_regex ~r/\{[^\/]+\}/
+  @brace_var_capture_regex ~r/\{([^\/]+)\}/
+
+  defp path_var_regex, do: @path_var_regex
+  defp brace_var_regex, do: @brace_var_regex
+  defp brace_var_capture_regex, do: @brace_var_capture_regex
 
   defp init_env do
     %{
