@@ -11,6 +11,8 @@ defmodule Casbin do
     ]
 
     :ets.new(:enforcers_table, [:public, :named_table])
+    Casbin.Internal.PatternCache.ensure_table()
+    Casbin.Store.ensure_tables()
 
     opts = [strategy: :one_for_one, name: Casbin.Supervisor]
     Supervisor.start_link(children, opts)

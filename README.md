@@ -269,9 +269,37 @@ defmodule MyApp.Repo.Migrations.CreateCasbinRule do
       add :v5, :string
       add :v6, :string
     end
+
+    # Required for duplicate protection: inserts use `on_conflict: :nothing`,
+    # which only dedupes when a unique index enforces uniqueness (relevant
+    # when several instances or restarts race on the same rule).
+    create unique_index(:casbin_rule, [:ptype, :v0, :v1, :v2, :v3, :v4, :v5, :v6],
+             name: :casbin_rule_unique_index,
+             nulls_distinct: false
+           )
   end
 end
 ```
+
+> `nulls_distinct: false` requires PostgreSQL 15+. On older versions, use a
+> unique index over `COALESCE`d expressions instead, e.g.
+> `CREATE UNIQUE INDEX casbin_rule_unique_index ON casbin_rule (ptype, COALESCE(v0,''), COALESCE(v1,''), COALESCE(v2,''), COALESCE(v3,''), COALESCE(v4,''), COALESCE(v5,''), COALESCE(v6,''))`.
+
+If you run multiple service instances against the same policies, also see
+[Multi-instance synchronization](guides/watcher.md) for the watcher setup and
+the `casbin_revision` migration.
+
+### Performance at scale
+
+`EnforcerServer.allow?/2` evaluates in the calling process against a shared
+ETS projection — concurrent checks do not serialize through the enforcer
+process — and, for matchers that decompose into equality/role conjuncts
+(plain ACL, RBAC, domains), only the policy buckets a request can possibly
+match are examined instead of the full policy list. With 50k rules an
+exact-match check costs single-digit microseconds. For batches use
+`EnforcerServer.add_policies/3` / `remove_policies/3`, which issue one
+storage write and one sync event per batch. See
+[bench/RESULTS.md](bench/RESULTS.md) for measurements.
 
 ### Loading Policies from Database
 

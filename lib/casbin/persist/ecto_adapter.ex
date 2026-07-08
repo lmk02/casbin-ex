@@ -177,6 +177,38 @@ defmodule Casbin.Persist.EctoAdapter do
     repo
   end
 
+  @doc false
+  # Converts any persisted-rule shape ({key, attrs} tuple, %Policy{} or a
+  # mapping map with a plain value list) into a casbin_rule row map. An
+  # implicit `eft: "allow"` is not written back — it is re-added on load.
+  def rule_row({key, attrs}) when is_atom(key) and is_list(attrs) do
+    CasbinRule.policy_to_map({key, attrs})
+  end
+
+  def rule_row(%{key: key, attrs: attrs}) when is_list(attrs) do
+    values =
+      if Keyword.keyword?(attrs) do
+        attrs
+        |> Enum.reject(fn {name, value} -> name == :eft and value == "allow" end)
+        |> Enum.map(fn {_name, value} -> value end)
+      else
+        attrs
+      end
+
+    CasbinRule.policy_to_map({key, values})
+  end
+
+  @doc false
+  # Postgres-only advisory lock serializing whole-table policy rewrites.
+  def acquire_table_lock(repo) do
+    if function_exported?(repo, :__adapter__, 0) and
+         repo.__adapter__() == Ecto.Adapters.Postgres do
+      repo.query!("SELECT pg_advisory_xact_lock(hashtext('casbin_rule'))")
+    end
+
+    :ok
+  end
+
   defimpl Casbin.Persist.PersistAdapter, for: Casbin.Persist.EctoAdapter do
     @doc """
     Queries the list of policy rules from the database and returns them
@@ -368,23 +400,26 @@ defmodule Casbin.Persist.EctoAdapter do
 
     def save_policies(adapter, policies) do
       repo = Casbin.Persist.EctoAdapter.get_repo(adapter)
-      repo.transaction(fn -> insert_policies(repo, adapter, policies) end)
-    end
+      rows = Enum.map(policies, &Casbin.Persist.EctoAdapter.rule_row/1)
 
-    defp insert_policies(repo, adapter, policies) do
-      repo.delete_all(CasbinRule)
-      Enum.each(policies, &insert_policy(repo, adapter, &1))
-    end
+      repo.transaction(fn ->
+        # Serialize whole-table rewrites against each other: two racing
+        # save_policies (from different instances) would otherwise
+        # interleave delete_all and inserts. Postgres only; other databases
+        # proceed unserialized as before.
+        Casbin.Persist.EctoAdapter.acquire_table_lock(repo)
+        repo.delete_all(CasbinRule)
 
-    defp insert_policy(repo, adapter, policy) do
-      changeset = CasbinRule.create_changeset(policy)
+        rows
+        # 8 columns x 2000 rows stays well below parameter limits
+        |> Enum.chunk_every(2_000)
+        |> Enum.each(fn chunk ->
+          # on_conflict: :nothing — same rationale as add_policy/2.
+          repo.insert_all(CasbinRule, chunk, on_conflict: :nothing)
+        end)
 
-      # on_conflict: :nothing — same rationale as add_policy/2: save_policies/2
-      # truncates then re-inserts all rules; a race or restart can cause duplicates.
-      case repo.insert(changeset, on_conflict: :nothing) do
-        {:ok, _casbin} -> adapter
-        {:error, changeset} -> {:error, changeset.errors}
-      end
+        adapter
+      end)
     end
   end
 end

@@ -47,6 +47,17 @@ defmodule Casbin.Model.PolicyEffect do
   end
 
   @doc """
+  Returns the short-circuit mode for the given policy effect.
+
+  `:allow_override` means the decision can halt `true` at the first
+  matched policy of type `allow`; `:deny_override` means the decision
+  can halt `false` at the first matched policy of type `deny`.
+  """
+  @spec mode(t()) :: :allow_override | :deny_override
+  def mode(%__MODULE__{rule: @allow_override}), do: :allow_override
+  def mode(%__MODULE__{rule: @deny_override}), do: :deny_override
+
+  @doc """
   Determine whether a request is approved or denied when there are
   multiple policy rules match the request.
 
