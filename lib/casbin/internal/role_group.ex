@@ -11,6 +11,8 @@ defmodule Casbin.Internal.RoleGroup do
   defstruct name: nil, role_graph: nil
 
   alias Casbin.Internal.Digraph
+  alias Casbin.Internal.PatternCache
+  alias Casbin.Store
 
   @type role_type() :: term()
 
@@ -87,6 +89,7 @@ defmodule Casbin.Internal.RoleGroup do
   """
   @spec add_inheritance(t(), {role_type(), role_type()}) :: t()
   def add_inheritance(%__MODULE__{role_graph: g} = group, {r1, r2}) do
+    purge_reachability(g)
     %{group | role_graph: g |> Digraph.add_edge({r1, r2})}
   end
 
@@ -104,7 +107,15 @@ defmodule Casbin.Internal.RoleGroup do
   """
   @spec remove_inheritance(t(), {role_type(), role_type()}) :: t()
   def remove_inheritance(%__MODULE__{role_graph: g} = group, {r1, r2}) do
+    purge_reachability(g)
     %{group | role_graph: g |> Digraph.remove_edge({r1, r2})}
+  end
+
+  # Evicts memoized reachability results for the graph version being
+  # superseded (see PatternCache): pair membership and candidate names.
+  defp purge_reachability(%Digraph{version: version}) do
+    PatternCache.purge(:role_reach, version)
+    PatternCache.purge(:role_names, version)
   end
 
   @doc """
@@ -133,6 +144,17 @@ defmodule Casbin.Internal.RoleGroup do
     r1 === r2 || g |> Digraph.has_path?(r1, r2)
   end
 
+  # inherit_from? backed by a memoized reachable set: the full DFS from
+  # `r1` runs once per (graph version, r1) instead of once per matcher
+  # evaluation — i.e. once instead of policies × requests times. Keyed by
+  # the graph's version reference, which changes on every edge mutation.
+  defp cached_inherit_from?(%Digraph{} = g, r1, r2) do
+    r1 === r2 ||
+      :role_reach
+      |> PatternCache.fetch({g.version, r1}, fn -> Digraph.reachable(g, r1) end)
+      |> Digraph.reachable_id?(r2)
+  end
+
   @doc """
   Returns a function used when evaluating a matcher program.
 
@@ -151,17 +173,61 @@ defmodule Casbin.Internal.RoleGroup do
       ...> f.("admin", "member", "domain")
       true
   """
-  def stub_2(%__MODULE__{} = group) do
+  def stub_2(%__MODULE__{role_graph: g}) do
     fn
       arg1, arg2 ->
-        group |> inherit_from?(arg1, arg2)
+        cached_inherit_from?(g, arg1, arg2)
     end
   end
 
-  def stub_3(%__MODULE__{} = group) do
+  def stub_3(%__MODULE__{role_graph: g}) do
     fn
       arg1, arg2, arg3 ->
-        group |> inherit_from?({arg1, arg3}, {arg2, arg3})
+        cached_inherit_from?(g, {arg1, arg3}, {arg2, arg3})
     end
+  end
+
+  @doc """
+  Like `stub_2/1`, but resolves the role graph through `Casbin.Store`
+  instead of capturing it in the closure. Used for the env projected into
+  the shared core row, which must stay small: the graph is only loaded
+  from ETS on a reachability-cache miss, never per call.
+  """
+  def ets_stub_2(ename, gname, version) do
+    fn
+      arg1, arg2 ->
+        ets_cached_inherit_from?(ename, gname, version, arg1, arg2)
+    end
+  end
+
+  @doc """
+  Domain variant of `ets_stub_2/3`.
+  """
+  def ets_stub_3(ename, gname, version) do
+    fn
+      arg1, arg2, arg3 ->
+        ets_cached_inherit_from?(ename, gname, version, {arg1, arg3}, {arg2, arg3})
+    end
+  end
+
+  defp ets_cached_inherit_from?(ename, gname, version, r1, r2) do
+    r1 === r2 ||
+      :role_reach
+      |> PatternCache.fetch({version, r1}, fn ->
+        case Store.fetch_role_graph(ename, gname) do
+          %Digraph{version: ^version} = graph ->
+            Digraph.reachable(graph, r1)
+
+          %Digraph{} = graph ->
+            # The projected graph is from a different (usually newer)
+            # generation than this stub: answer from it, but do not poison
+            # the cache entry for `version`.
+            {:nocache, Digraph.reachable(graph, r1)}
+
+          nil ->
+            {:nocache, MapSet.new()}
+        end
+      end)
+      |> Digraph.reachable_id?(r2)
   end
 end

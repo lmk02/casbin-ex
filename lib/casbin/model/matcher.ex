@@ -3,7 +3,7 @@ defmodule Casbin.Model.Matcher do
   This module defines a structure to represent a matcher expression.
   """
 
-  defstruct prog: nil
+  defstruct prog: nil, ast: nil
 
   @type instr() ::
           {:push, number()}
@@ -30,7 +30,8 @@ defmodule Casbin.Model.Matcher do
   @type program() :: [instr()]
 
   @type t() :: %__MODULE__{
-          prog: program()
+          prog: program(),
+          ast: term()
         }
 
   alias Casbin.Internal.{Helpers, Operator, Parser}
@@ -125,8 +126,10 @@ defmodule Casbin.Model.Matcher do
       {:error, reason} ->
         {:error, reason}
 
-      {:ok, postfix} ->
-        %__MODULE__{prog: postfix |> compile()}
+      {:ok, expr} ->
+        # The expression tree is kept for static analysis (policy index
+        # derivation); evaluation uses the compiled program.
+        %__MODULE__{prog: expr |> compile(), ast: expr}
     end
   end
 

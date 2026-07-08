@@ -4,7 +4,7 @@ defmodule Casbin.MixProject do
   def project do
     [
       app: :casbin,
-      version: "1.6.1",
+      version: "1.7.0",
       elixir: "~> 1.13",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -32,6 +32,13 @@ defmodule Casbin.MixProject do
   defp deps do
     [
       {:ecto_sql, "~> 3.10"},
+      # Optional backends for Casbin.Watcher (multi-instance policy sync):
+      # redix for the Redis pub/sub watcher, postgrex for the Postgres
+      # LISTEN/NOTIFY watcher, jason as JSON codec on Elixir < 1.18.
+      {:redix, "~> 1.5", optional: true},
+      {:postgrex, ">= 0.0.0", optional: true},
+      {:jason, "~> 1.4", optional: true},
+      {:benchee, "~> 1.3", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:git_hooks, "~> 0.7.3", only: [:dev], runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
